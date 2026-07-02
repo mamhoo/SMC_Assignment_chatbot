@@ -4,23 +4,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
-import jwt
+from jose import jwt
 from datetime import datetime, timedelta
-from typing import TypedDict, Annotated
+from typing import TypedDict
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.utilities import SQLDatabase
-from langchain.agents import create_sql_agent
-from langchain_community.vectorstores import Pinecone
-from langchain.chains import RetrievalQA
-from pinecone import Pinecone
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone, ServerlessSpec
 from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langchain_core.messages import HumanMessage, AIMessage
 
 load_dotenv()
 
-app = FastAPI(title="Financial Chatbot")
+app = FastAPI(title="Financial Chatbot - LangGraph")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -43,14 +41,25 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=os.getenv("O
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=os.getenv("OPENAI_API_KEY"))
 
 sql_db = SQLDatabase.from_uri("postgresql://postgres:postgres@localhost:5432/financial_db")
-sql_agent = create_sql_agent(llm, sql_db, verbose=True)
+toolkit = SQLDatabaseToolkit(db=sql_db, llm=llm)
+sql_agent = create_sql_agent(llm=llm, toolkit=toolkit, verbose=True)
 
-pc = Pinecone(api_key="dummy", host="http://localhost:5080")
-vectorstore = Pinecone.from_existing_index(index_name="financial-10k", embedding=embeddings)
-rag_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=vectorstore.as_retriever(search_kwargs={"k": 5}), return_source_documents=True)
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+if "financial-10k" not in pc.list_indexes().names():
+    pc.create_index(
+        name="financial-10k",
+        dimension=1536,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
+
+vectorstore = PineconeVectorStore(
+    index_name="financial-10k",
+    embedding=embeddings,
+    pinecone_api_key=os.getenv("PINECONE_API_KEY")
+)
 
 class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
     question: str
     route: str
     answer: str
@@ -66,8 +75,10 @@ def sql_node(state: AgentState):
     return {"answer": result["output"], "source": "SQL Database"}
 
 def rag_node(state: AgentState):
-    result = rag_chain.invoke({"query": state["question"]})
-    return {"answer": result["result"], "source": "Pinecone 10-K RAG"}
+    docs = vectorstore.similarity_search(state["question"], k=4)
+    context = "\n".join([doc.page_content for doc in docs])
+    result = llm.invoke(f"Context: {context}\nQuestion: {state['question']}\nAnswer:")
+    return {"answer": result.content, "source": "Pinecone 10-K RAG"}
 
 workflow = StateGraph(AgentState)
 workflow.add_node("router", router_node)
@@ -90,8 +101,12 @@ async def chat(request: ChatRequest, token: str = Depends(oauth2_scheme)):
         jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
     except:
         raise HTTPException(status_code=401)
-    result = agent_graph.invoke({"question": request.question})
-    return {"answer": result["answer"], "source": result["source"]}
+    
+    try:
+        result = agent_graph.invoke({"question": request.question})
+        return {"answer": result["answer"], "source": result["source"]}
+    except Exception as e:
+        return {"answer": f"Error processing question: {str(e)}", "source": "Error"}
 
 if __name__ == "__main__":
     import uvicorn
